@@ -10,9 +10,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/chenhg5/cc-connect/core"
 
@@ -30,6 +32,7 @@ type replyContext struct {
 	sessionWebhook string
 	conversationId string
 	senderStaffId  string
+	messageID      string
 	isGroup        bool
 	proactive      bool // true when constructed by ReconstructReplyCtx (no sessionWebhook)
 }
@@ -54,6 +57,14 @@ type repliedTextContent struct {
 
 const maxQuotedMessageRunes = 4000
 
+const (
+	defaultReactionEmoji        = "🤔Thinking"
+	customTextEmotionID         = "2659900"
+	customTextEmotionBackground = "im_bg_1"
+	cardTitleMaxRunes           = 20
+	cardTitleFallback           = "reply"
+)
+
 type downloadResponse struct {
 	DownloadUrl string `json:"downloadUrl"`
 }
@@ -73,6 +84,8 @@ type Platform struct {
 	tokenMu               sync.Mutex
 	accessToken           string
 	tokenExpiry           time.Time
+	reactionEmoji         string
+	doneEmoji             string
 	// AI Card configuration
 	cardTemplateID  string
 	cardTemplateKey string
@@ -97,6 +110,20 @@ func New(opts map[string]any) (core.Platform, error) {
 	// Validate robot_code format (should not be empty after fallback)
 	if robotCode == "" {
 		return nil, fmt.Errorf("dingtalk: robot_code is required (or client_id)")
+	}
+
+	reactionEmoji, _ := opts["reaction_emoji"].(string)
+	reactionEmoji = strings.TrimSpace(reactionEmoji)
+	if reactionEmoji == "" {
+		reactionEmoji = defaultReactionEmoji
+	}
+	if strings.EqualFold(reactionEmoji, "none") {
+		reactionEmoji = ""
+	}
+	doneEmoji, _ := opts["done_emoji"].(string)
+	doneEmoji = strings.TrimSpace(doneEmoji)
+	if strings.EqualFold(doneEmoji, "none") {
+		doneEmoji = ""
 	}
 
 	// agent_id is required for work notifications API (numeric type)
@@ -134,6 +161,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		allowFrom:             allowFrom,
 		shareSessionInChannel: shareSessionInChannel,
 		httpClient:            &http.Client{Timeout: 30 * time.Second},
+		reactionEmoji:         reactionEmoji,
+		doneEmoji:             doneEmoji,
 		cardTemplateID:        cardTemplateID,
 		cardTemplateKey:       cardTemplateKey,
 		cardThrottleMs:        cardThrottleMs,
@@ -174,9 +203,17 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			default:
 			}
 
-			if err := p.streamClient.Start(ctx); err != nil {
-				slog.Warn("dingtalk: stream disconnected, reconnecting", "error", err)
-			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("dingtalk: stream panic recovered, will reconnect",
+							"panic", r)
+					}
+				}()
+				if err := p.streamClient.Start(ctx); err != nil {
+					slog.Warn("dingtalk: stream disconnected, reconnecting", "error", err)
+				}
+			}()
 
 			// Brief pause before reconnecting to avoid tight loop on persistent failures.
 			select {
@@ -232,6 +269,7 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel, richText *richT
 
 	if !core.AllowList(p.allowFrom, data.SenderStaffId) {
 		slog.Debug("dingtalk: message from unauthorized user", "user", data.SenderStaffId)
+		p.replyUnauthorized(data)
 		return
 	}
 
@@ -272,6 +310,8 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel, richText *richT
 				sessionWebhook: data.SessionWebhook,
 				conversationId: data.ConversationId,
 				senderStaffId:  data.SenderStaffId,
+				messageID:      data.MsgId,
+				isGroup:        data.ConversationType == "2",
 			},
 		}
 		p.handler(p, msg)
@@ -283,6 +323,14 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel, richText *richT
 	// on the client and robot type. Both carry the same downloadCode field.
 	if data.Msgtype == "image" || data.Msgtype == "picture" {
 		p.handleImageMessage(data, sessionKey)
+		return
+	}
+
+	// Handle file messages (PDF, txt, docx, …). Same downloadCode mechanism as
+	// images, but the payload also carries fileName / fileSize that we surface
+	// to the agent via core.FileAttachment.FileName.
+	if data.Msgtype == "file" {
+		p.handleFileMessage(data, sessionKey)
 		return
 	}
 
@@ -307,11 +355,29 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel, richText *richT
 			sessionWebhook: data.SessionWebhook,
 			conversationId: data.ConversationId,
 			senderStaffId:  data.SenderStaffId,
+			messageID:      data.MsgId,
 			isGroup:        data.ConversationType == "2",
 		},
 	}
 
 	p.handler(p, msg)
+}
+
+func (p *Platform) replyUnauthorized(data *chatbot.BotCallbackDataModel) {
+	if data == nil || data.SessionWebhook == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := p.Reply(ctx, replyContext{
+		sessionWebhook: data.SessionWebhook,
+		conversationId: data.ConversationId,
+		senderStaffId:  data.SenderStaffId,
+		isGroup:        data.ConversationType == "2",
+	}, core.UnauthorizedAccessMessage)
+	if err != nil {
+		slog.Warn("dingtalk: unauthorized reply failed", "error", err)
+	}
 }
 
 // extractRichText extracts plain text from a DingTalk richText content payload.
@@ -375,6 +441,7 @@ func (p *Platform) handleAudioMessage(data *chatbot.BotCallbackDataModel, sessio
 					sessionWebhook: data.SessionWebhook,
 					conversationId: data.ConversationId,
 					senderStaffId:  data.SenderStaffId,
+					messageID:      data.MsgId,
 					isGroup:        data.ConversationType == "2",
 				},
 				FromVoice: true,
@@ -399,6 +466,7 @@ func (p *Platform) handleAudioMessage(data *chatbot.BotCallbackDataModel, sessio
 			sessionWebhook: data.SessionWebhook,
 			conversationId: data.ConversationId,
 			senderStaffId:  data.SenderStaffId,
+			messageID:      data.MsgId,
 			isGroup:        data.ConversationType == "2",
 		},
 		FromVoice: true,
@@ -440,7 +508,7 @@ func (p *Platform) handleImageMessage(data *chatbot.BotCallbackDataModel, sessio
 		slog.Error("dingtalk: failed to download image", "error", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("dingtalk: image download returned status", "status", resp.StatusCode)
@@ -475,10 +543,96 @@ func (p *Platform) handleImageMessage(data *chatbot.BotCallbackDataModel, sessio
 			sessionWebhook: data.SessionWebhook,
 			conversationId: data.ConversationId,
 			senderStaffId:  data.SenderStaffId,
+			messageID:      data.MsgId,
+			isGroup:        data.ConversationType == "2",
 		},
 		Images: []core.ImageAttachment{{
 			MimeType: mimeType,
 			Data:     imgBytes,
+		}},
+	}
+
+	p.handler(p, msg)
+}
+
+// handleFileMessage downloads a file attachment (msgtype=file) and dispatches
+// it to the engine as a core.FileAttachment so the agent can read its contents.
+// Mirrors handleImageMessage but uses a larger size cap (50 MiB) and preserves
+// the file name reported by DingTalk.
+func (p *Platform) handleFileMessage(data *chatbot.BotCallbackDataModel, sessionKey string) {
+	slog.Debug("dingtalk: file message received", "user", data.SenderNick)
+
+	fileData, ok := data.Content.(map[string]interface{})
+	if !ok {
+		slog.Error("dingtalk: invalid file content type", "type", fmt.Sprintf("%T", data.Content))
+		return
+	}
+
+	downloadCode, _ := fileData["downloadCode"].(string)
+	if downloadCode == "" {
+		slog.Error("dingtalk: file message missing downloadCode")
+		return
+	}
+
+	fileName, _ := fileData["fileName"].(string)
+
+	downloadURL, err := p.getDownloadURL(downloadCode)
+	if err != nil {
+		slog.Error("dingtalk: failed to get file download URL", "error", err)
+		return
+	}
+
+	resp, err := p.httpClient.Get(downloadURL)
+	if err != nil {
+		slog.Error("dingtalk: failed to download file", "error", err)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("dingtalk: file download returned status", "status", resp.StatusCode)
+		return
+	}
+
+	// DingTalk caps single file at 100 MiB; 50 MiB is plenty for agent inputs
+	// and matches what other platforms accept without OOM risk.
+	const maxFileBytes = 50 * 1024 * 1024
+	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxFileBytes+1))
+	if err != nil {
+		slog.Error("dingtalk: failed to read file data", "error", err)
+		return
+	}
+	if len(fileBytes) > maxFileBytes {
+		slog.Error("dingtalk: file too large, dropping", "size", len(fileBytes), "limit", maxFileBytes, "file_name", fileName)
+		return
+	}
+
+	mimeType := resp.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	slog.Info("dingtalk: file downloaded successfully", "size", len(fileBytes), "mime", mimeType, "file_name", fileName)
+
+	msg := &core.Message{
+		SessionKey: sessionKey,
+		Platform:   "dingtalk",
+		UserID:     data.SenderStaffId,
+		UserName:   data.SenderNick,
+		ChatName:   data.ConversationTitle,
+		MessageID:  data.MsgId,
+		ChannelKey: data.ConversationId,
+		ReplyCtx: replyContext{
+			sessionWebhook: data.SessionWebhook,
+			conversationId: data.ConversationId,
+			senderStaffId:  data.SenderStaffId,
+			messageID:      data.MsgId,
+			isGroup:        data.ConversationType == "2",
+		},
+		Files: []core.FileAttachment{{
+			MimeType: mimeType,
+			Data:     fileBytes,
+			FileName: fileName,
 		}},
 	}
 
@@ -497,7 +651,7 @@ func (p *Platform) downloadAudio(downloadCode string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("http get: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("download returned status %d", resp.StatusCode)
@@ -548,7 +702,7 @@ func (p *Platform) getDownloadURL(downloadCode string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("api returned status %d", resp.StatusCode)
@@ -600,7 +754,7 @@ func (p *Platform) getAccessToken() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("do request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -639,22 +793,26 @@ func (p *Platform) getAccessToken() (string, error) {
 	return p.accessToken, nil
 }
 
-func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
+// ReplyWithAt sends a reply with @mention support. Uses text msgtype (not markdown)
+// because only text type supports highlighted/blue @mentions in DingTalk.
+func (p *Platform) ReplyWithAt(ctx context.Context, rctx any, content string, atUsers []string, atAll bool) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("dingtalk: invalid reply context type %T", rctx)
 	}
-
-	// Fall back to proactive API when sessionWebhook is unavailable
 	if rc.proactive || rc.sessionWebhook == "" {
 		return p.sendProactiveMessage(ctx, rc, content)
 	}
 
-	content = preprocessDingTalkMarkdown(content)
-
 	payload := map[string]any{
-		"msgtype":  "markdown",
-		"markdown": map[string]string{"title": "reply", "text": content},
+		"msgtype": "text",
+		"text":    map[string]string{"content": content},
+	}
+	if len(atUsers) > 0 || atAll {
+		payload["at"] = map[string]any{
+			"atUserIds": atUsers,
+			"isAtAll":   atAll,
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -671,7 +829,55 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if err != nil {
 		return fmt.Errorf("dingtalk: send reply: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("dingtalk: reply returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("dingtalk: invalid reply context type %T", rctx)
+	}
+
+	// Fall back to proactive API when sessionWebhook is unavailable
+	if rc.proactive || rc.sessionWebhook == "" {
+		return p.sendProactiveMessage(ctx, rc, content)
+	}
+
+	atUserIds := extractAtUserIds(content)
+
+	content = preprocessDingTalkMarkdown(content)
+
+	payload := map[string]any{
+		"msgtype":  "markdown",
+		"markdown": map[string]string{"title": cardTitleFromContent(content), "text": content},
+	}
+	if len(atUserIds) > 0 {
+		payload["at"] = map[string]any{
+			"atUserIds": atUserIds,
+			"isAtAll":   false,
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("dingtalk: marshal reply: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rc.sessionWebhook, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("dingtalk: create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := core.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("dingtalk: send reply: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("dingtalk: reply returned status %d", resp.StatusCode)
@@ -690,6 +896,117 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		return p.sendProactiveMessage(ctx, rc, content)
 	}
 	return p.Reply(ctx, rctx, content)
+}
+
+type dingtalkTextEmotion struct {
+	EmotionID    string `json:"emotionId"`
+	EmotionName  string `json:"emotionName"`
+	Text         string `json:"text"`
+	BackgroundID string `json:"backgroundId"`
+}
+
+type dingtalkEmotionRequest struct {
+	RobotCode          string              `json:"robotCode"`
+	OpenMsgID          string              `json:"openMsgId"`
+	OpenConversationID string              `json:"openConversationId"`
+	EmotionType        int                 `json:"emotionType"`
+	EmotionName        string              `json:"emotionName"`
+	TextEmotion        dingtalkTextEmotion `json:"textEmotion"`
+}
+
+func (p *Platform) sendEmotion(ctx context.Context, rc replyContext, emoji string, recall bool) error {
+	emoji = strings.TrimSpace(emoji)
+	if emoji == "" || rc.messageID == "" || rc.conversationId == "" {
+		return nil
+	}
+	if p.httpClient == nil {
+		p.httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	token, err := p.getAccessToken()
+	if err != nil {
+		return fmt.Errorf("dingtalk: get access token for emotion: %w", err)
+	}
+
+	path := "/v1.0/robot/emotion/reply"
+	if recall {
+		path = "/v1.0/robot/emotion/recall"
+	}
+	requestBody := dingtalkEmotionRequest{
+		RobotCode:          p.robotCode,
+		OpenMsgID:          rc.messageID,
+		OpenConversationID: rc.conversationId,
+		EmotionType:        2,
+		EmotionName:        emoji,
+		TextEmotion: dingtalkTextEmotion{
+			EmotionID:    customTextEmotionID,
+			EmotionName:  emoji,
+			Text:         emoji,
+			BackgroundID: customTextEmotionBackground,
+		},
+	}
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("dingtalk: marshal emotion request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.dingtalk.com"+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("dingtalk: create emotion request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("dingtalk: emotion request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("dingtalk: emotion returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+	if len(respBody) == 0 {
+		return nil
+	}
+	var result struct {
+		Success *bool `json:"success"`
+	}
+	if err := json.Unmarshal(respBody, &result); err == nil && result.Success != nil && !*result.Success {
+		return fmt.Errorf("dingtalk: emotion returned success=false")
+	}
+	return nil
+}
+
+// StartTyping adds a DingTalk emotion to the user's message while the agent is processing.
+func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
+	rc, ok := rctx.(replyContext)
+	if !ok || p.reactionEmoji == "" || rc.messageID == "" || rc.conversationId == "" {
+		return func() {}
+	}
+	if err := p.sendEmotion(ctx, rc, p.reactionEmoji, false); err != nil {
+		slog.Debug("dingtalk: add typing emotion failed", "error", err)
+	}
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.sendEmotion(ctx, rc, p.reactionEmoji, true); err != nil {
+			slog.Debug("dingtalk: recall typing emotion failed", "error", err)
+		}
+	}
+}
+
+// AddDoneReaction adds a DingTalk done emotion when configured.
+func (p *Platform) AddDoneReaction(rctx any) {
+	rc, ok := rctx.(replyContext)
+	if !ok || p.doneEmoji == "" || rc.messageID == "" || rc.conversationId == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.sendEmotion(ctx, rc, p.doneEmoji, false); err != nil {
+		slog.Debug("dingtalk: add done emotion failed", "error", err)
+	}
 }
 
 // SendImage uploads and sends an image via DingTalk oToMessages API.
@@ -743,7 +1060,7 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 	if err != nil {
 		return fmt.Errorf("dingtalk: send image request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	slog.Debug("dingtalk: oToMessages image response", "status", resp.StatusCode, "body", string(respBody))
@@ -759,6 +1076,8 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 var _ core.ImageSender = (*Platform)(nil)
 var _ core.StreamingCardPlatform = (*Platform)(nil)
 var _ core.ReplyContextReconstructor = (*Platform)(nil)
+var _ core.TypingIndicator = (*Platform)(nil)
+var _ core.TypingIndicatorDone = (*Platform)(nil)
 
 // CreateStreamingCard creates a new streaming card for the given reply context.
 // Implements core.StreamingCardPlatform.
@@ -836,7 +1155,7 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 	if err != nil {
 		return fmt.Errorf("dingtalk: send file request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	slog.Debug("dingtalk: oToMessages file response", "status", resp.StatusCode, "body", string(respBody))
@@ -961,7 +1280,7 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 	if err != nil {
 		return fmt.Errorf("dingtalk: send audio request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	slog.Debug("dingtalk: oToMessages API response", "status", resp.StatusCode, "body", string(respBody))
@@ -1052,7 +1371,7 @@ func (p *Platform) uploadMedia(ctx context.Context, data []byte, fileName, media
 	if err != nil {
 		return "", fmt.Errorf("upload request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1345,7 +1664,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 	} else if rc.senderStaffId != "" {
 		// Direct message via /v1.0/robot/oToMessages/batchSend
 		apiURL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
-		msgParam, _ := json.Marshal(map[string]string{"title": "reply", "text": content})
+		msgParam, _ := json.Marshal(map[string]string{"title": cardTitleFromContent(content), "text": content})
 		requestBody = map[string]any{
 			"robotCode": p.robotCode,
 			"userIds":   []string{rc.senderStaffId},
@@ -1372,7 +1691,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 	if err != nil {
 		return fmt.Errorf("dingtalk: proactive send request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
@@ -1381,6 +1700,23 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 
 	slog.Debug("dingtalk: proactive message sent", "api", apiURL, "status", resp.StatusCode)
 	return nil
+}
+
+var atUserIDRegexp = regexp.MustCompile(`@(\d{4,})`)
+
+// extractAtUserIds extracts @userId patterns from content for DingTalk's atUserIds field.
+// Matches @ followed by numeric DingTalk user IDs (e.g. @194252073827812352).
+func extractAtUserIds(content string) []string {
+	matches := atUserIDRegexp.FindAllStringSubmatch(content, -1)
+	seen := make(map[string]bool)
+	var ids []string
+	for _, m := range matches {
+		if len(m) > 1 && !seen[m[1]] {
+			seen[m[1]] = true
+			ids = append(ids, m[1])
+		}
+	}
+	return ids
 }
 
 // preprocessDingTalkMarkdown adapts content for DingTalk's markdown renderer:
@@ -1417,4 +1753,58 @@ func preprocessDingTalkMarkdown(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// cardTitleFromContent derives a short single-line preview title from message
+// content, suitable for the DingTalk chat list and notification previews
+// (the `markdown.title` field on sampleMarkdown messages).
+//
+// Behaviour:
+//   - Strips markdown formatting via core.StripMarkdown so titles don't show
+//     leftover ** / # / ` markers.
+//   - Trims whitespace, takes the first non-empty line, and truncates to
+//     cardTitleMaxRunes runes (Chinese / emoji counted as 1 rune each so we
+//     never split a multi-byte character mid-codepoint).
+//   - Falls back to cardTitleFallback when nothing readable remains — empty
+//     input, whitespace-only, pure emoji, or content that strips down to
+//     only orphan markdown markers (e.g. "****", "####"). Pure emoji is
+//     treated as not-readable on purpose: the user's spec lists emoji-only
+//     as a fallback case, and showing a lone 🎉 as a DingTalk chat list
+//     preview is usually less helpful than the previous "reply".
+//
+// Previously both Reply and sendProactiveMessage hardcoded "reply", which
+// made every DingTalk chat list entry look identical regardless of what the
+// agent actually said (#1269).
+func cardTitleFromContent(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return cardTitleFallback
+	}
+	stripped := strings.TrimSpace(core.StripMarkdown(content))
+	if stripped == "" || !hasReadableChar(stripped) {
+		return cardTitleFallback
+	}
+	if idx := strings.IndexByte(stripped, '\n'); idx >= 0 {
+		stripped = strings.TrimSpace(stripped[:idx])
+		if stripped == "" || !hasReadableChar(stripped) {
+			return cardTitleFallback
+		}
+	}
+	runes := []rune(stripped)
+	if len(runes) > cardTitleMaxRunes {
+		return string(runes[:cardTitleMaxRunes])
+	}
+	return stripped
+}
+
+// hasReadableChar reports whether s contains at least one letter or digit
+// (including CJK ideographs). Used to decide whether a stripped title has
+// enough semantic content to show in the chat list — pure markdown markers,
+// pure emoji, and pure whitespace are treated as "not readable".
+func hasReadableChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
